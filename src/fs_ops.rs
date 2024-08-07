@@ -2,25 +2,24 @@ use crate::db;
 use rusqlite::Connection;
 use rusqlite::Result;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::time::UNIX_EPOCH;
-use walkdir::WalkDir;
 
-/// Processes the entire directory and delegates file handling to `process_file`
-pub fn process_directory(conn: &Connection, directory: &str) -> Result<()> {
-    for entry in WalkDir::new(directory).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            process_file(conn, path)?;
-        }
-    }
-    Ok(())
-}
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 /// Processes a single file, extracts metadata and inserts it into the database
 fn process_file(conn: &Connection, path: &std::path::Path) -> Result<()> {
     let metadata = fs::metadata(path).expect("Failed to get metadata");
-    let fs_type = get_filesystem_type(&metadata);
+
+    #[cfg(unix)]
+    let fs_type = get_filesystem_type_unix(&metadata);
+
+    #[cfg(windows)]
+    let fs_type = get_filesystem_type_windows(&metadata);
+
     let filesystem_id = db::insert_or_get_filesystem(conn, &fs_type)?;
     let file_size = metadata.len();
 
@@ -58,6 +57,20 @@ fn process_file(conn: &Connection, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Determines the filesystem type in a Unix-specific manner
+#[cfg(unix)]
+fn get_filesystem_type_unix(metadata: &fs::Metadata) -> String {
+    let dev = metadata.dev();
+    format!("FS_TYPE_FOR_DEV_{}", dev)
+}
+
+/// Determines the filesystem type in a Windows-specific manner
+#[cfg(windows)]
+fn get_filesystem_type_windows(metadata: &fs::Metadata) -> String {
+    let file_index = metadata.file_index();
+    format!("FS_TYPE_FOR_FILE_INDEX_{:?}", file_index)
+}
+
 /// Inserts the file metadata into the database
 fn insert_file_metadata(
     conn: &Connection,
@@ -69,9 +82,4 @@ fn insert_file_metadata(
 ) -> Result<()> {
     db::insert_file(conn, filesystem_id, name, path, size, modified)?;
     Ok(())
-}
-
-fn get_filesystem_type(metadata: &fs::Metadata) -> String {
-    let dev = metadata.dev();
-    format!("FS_TYPE_FOR_DEV_{}", dev)
 }
