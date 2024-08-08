@@ -1,6 +1,7 @@
 use crate::db;
 use rusqlite::Connection;
 use rusqlite::Result;
+use walkdir::WalkDir;
 use std::fs;
 use std::time::UNIX_EPOCH;
 
@@ -9,6 +10,18 @@ use std::os::unix::fs::MetadataExt;
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+
+
+/// Processes the entire directory and delegates file handling to `process_file`
+pub fn process_directory(conn: &Connection, directory: &str) -> Result<()> {
+    for entry in WalkDir::new(directory).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() {
+            process_file(conn, path)?;
+        }
+    }
+    Ok(())
+}
 
 /// Processes a single file, extracts metadata and inserts it into the database
 fn process_file(conn: &Connection, path: &std::path::Path) -> Result<()> {
