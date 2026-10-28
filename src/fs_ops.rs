@@ -1,5 +1,3 @@
-use crate::db;
-use rusqlite::Connection;
 use rusqlite::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,29 +7,71 @@ use walkdir::WalkDir;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+/// One regular file observed during a walk.
+pub struct Entry {
+    /// `./relative/to/root`, matching the v1 convention.
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub inode: i64,
+}
 
-/// Walks `directory` and records every regular file. Returns the row count.
-pub fn process_directory(conn: &Connection, directory: &str) -> Result<u64> {
-    let root = Path::new(directory);
-    let mut indexed = 0u64;
+/// Walks `root` and hands every regular file to `cb`. Excluded paths are skipped
+/// before the metadata call, so a pruned `node_modules` costs nothing.
+pub fn walk<F>(root: &str, excludes: &[String], mut cb: F) -> Result<u64>
+where
+    F: FnMut(Entry) -> Result<()>,
+{
+    let root_path = Path::new(root);
+    let mut seen = 0u64;
 
-    for entry in WalkDir::new(directory).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        if process_file(conn, path, root)? {
-            indexed += 1;
+
+        let rel = match normalize(path, root_path) {
+            Some(r) => r,
+            None => continue,
+        };
+        if is_excluded(&rel, excludes) {
+            continue;
         }
+
+        // metadata follows symlinks, matching the previous behaviour
+        let md = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        cb(Entry {
+            path: rel,
+            name,
+            size: md.len(),
+            mtime,
+            inode: inode_of(&md),
+        })?;
+        seen += 1;
     }
 
-    Ok(indexed)
+    Ok(seen)
 }
 
-/// Normalises a path to `./relative/to/root` so that scanning `.` and scanning
-/// an absolute directory produce identical rows for the same file.
+/// Normalises to `./relative` so scanning `.` and an absolute directory agree.
 fn normalize(path: &Path, root: &Path) -> Option<String> {
     let rel: PathBuf = path.strip_prefix(root).unwrap_or(path).to_path_buf();
     let rel = rel.to_str()?;
@@ -41,71 +81,41 @@ fn normalize(path: &Path, root: &Path) -> Option<String> {
     Some(format!("./{}", rel.trim_start_matches("./")))
 }
 
-/// Handles a single file: metadata lookup and insert. Returns true if a row was written.
-fn process_file(conn: &Connection, path: &Path, root: &Path) -> Result<bool> {
-    let metadata = match fs::metadata(path) {
-        Ok(m) => m,
-        // a file removed between the walk and the stat is not an error
-        Err(_) => return Ok(false),
-    };
+/// A pattern matches if it equals the path, prefixes it, or names any single
+/// path component. Enough for `node_modules`, `.mypy_cache`, `./Library/Caches`.
+fn is_excluded(rel: &str, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let trimmed = rel.trim_start_matches("./");
+    let components: Vec<&str> = trimmed.split('/').collect();
 
-    #[cfg(unix)]
-    let fs_type = get_filesystem_type_unix(&metadata);
-
-    #[cfg(windows)]
-    let fs_type = get_filesystem_type_windows(&metadata);
-
-    let filesystem_id = db::insert_or_get_filesystem(conn, &fs_type)?;
-    let file_size = metadata.len();
-
-    let modified_time = match metadata.modified() {
-        Ok(t) => t,
-        Err(_) => return Ok(false),
-    };
-    let modified_secs = match modified_time.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        // pre-1970 timestamps: record as zero rather than aborting the walk
-        Err(_) => 0,
-    };
-
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => {
-            println!("File name is not valid Unicode: {:?}", path);
-            return Ok(false);
-        }
-    };
-
-    let path_str = match normalize(path, root) {
-        Some(p) => p,
-        None => {
-            println!("Path is not valid Unicode: {:?}", path);
-            return Ok(false);
-        }
-    };
-
-    db::insert_file(
-        conn,
-        filesystem_id,
-        name,
-        &path_str,
-        file_size,
-        modified_secs,
-    )?;
-
-    Ok(true)
+    excludes.iter().any(|raw| {
+        let pat = raw.trim().trim_matches('/').trim_start_matches("./");
+        !pat.is_empty()
+            && (trimmed == pat
+                || trimmed.starts_with(&format!("{}/", pat))
+                || components.contains(&pat))
+    })
 }
 
-/// Determines the filesystem type in a Unix-specific manner
 #[cfg(unix)]
-fn get_filesystem_type_unix(metadata: &fs::Metadata) -> String {
-    let dev = metadata.dev();
-    format!("FS_TYPE_FOR_DEV_{}", dev)
+fn inode_of(md: &fs::Metadata) -> i64 {
+    md.ino() as i64
 }
 
-/// Determines the filesystem type in a Windows-specific manner
-#[cfg(windows)]
-fn get_filesystem_type_windows(metadata: &fs::Metadata) -> String {
-    let file_index = metadata.file_index();
-    format!("FS_TYPE_FOR_FILE_INDEX_{:?}", file_index)
+#[cfg(not(unix))]
+fn inode_of(_md: &fs::Metadata) -> i64 {
+    0
+}
+
+/// Filesystem marker used to identify the volume a root lives on.
+pub fn filesystem_type(root: &str) -> String {
+    match fs::metadata(root) {
+        #[cfg(unix)]
+        Ok(md) => format!("FS_TYPE_FOR_DEV_{}", md.dev()),
+        #[cfg(not(unix))]
+        Ok(_) => "FS_TYPE_UNKNOWN".to_string(),
+        Err(_) => "FS_TYPE_UNKNOWN".to_string(),
+    }
 }
