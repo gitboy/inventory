@@ -1,9 +1,10 @@
 use crate::db;
 use rusqlite::Connection;
 use rusqlite::Result;
-use walkdir::WalkDir;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use walkdir::WalkDir;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -11,21 +12,42 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
+/// Walks `directory` and records every regular file. Returns the row count.
+pub fn process_directory(conn: &Connection, directory: &str) -> Result<u64> {
+    let root = Path::new(directory);
+    let mut indexed = 0u64;
 
-/// Processes the entire directory and delegates file handling to `process_file`
-pub fn process_directory(conn: &Connection, directory: &str) -> Result<()> {
     for entry in WalkDir::new(directory).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file() {
-            process_file(conn, path)?;
+        if !path.is_file() {
+            continue;
+        }
+        if process_file(conn, path, root)? {
+            indexed += 1;
         }
     }
-    Ok(())
+
+    Ok(indexed)
 }
 
-/// Processes a single file, extracts metadata and inserts it into the database
-fn process_file(conn: &Connection, path: &std::path::Path) -> Result<()> {
-    let metadata = fs::metadata(path).expect("Failed to get metadata");
+/// Normalises a path to `./relative/to/root` so that scanning `.` and scanning
+/// an absolute directory produce identical rows for the same file.
+fn normalize(path: &Path, root: &Path) -> Option<String> {
+    let rel: PathBuf = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let rel = rel.to_str()?;
+    if rel.is_empty() || rel == "." {
+        return None;
+    }
+    Some(format!("./{}", rel.trim_start_matches("./")))
+}
+
+/// Handles a single file: metadata lookup and insert. Returns true if a row was written.
+fn process_file(conn: &Connection, path: &Path, root: &Path) -> Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        // a file removed between the walk and the stat is not an error
+        Err(_) => return Ok(false),
+    };
 
     #[cfg(unix)]
     let fs_type = get_filesystem_type_unix(&metadata);
@@ -36,38 +58,42 @@ fn process_file(conn: &Connection, path: &std::path::Path) -> Result<()> {
     let filesystem_id = db::insert_or_get_filesystem(conn, &fs_type)?;
     let file_size = metadata.len();
 
-    // Get the absolute modified time
-    let modified_time = metadata.modified().expect("Failed to get modified time");
-    let duration_since_epoch = modified_time
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    let modified_secs = duration_since_epoch.as_secs();
+    let modified_time = match metadata.modified() {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    let modified_secs = match modified_time.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        // pre-1970 timestamps: record as zero rather than aborting the walk
+        Err(_) => 0,
+    };
 
-    if let Some(filename) = path.file_name() {
-        if let Some(name) = filename.to_str() {
-            if let Some(path_str) = path.to_str() {
-                insert_file_metadata(
-                    conn,
-                    filesystem_id,
-                    name,
-                    path_str,
-                    file_size,
-                    modified_secs,
-                )?;
-            } else {
-                println!("Path is not valid Unicode: {:?}", path);
-            }
-        } else {
-            println!(
-                "File name is not valid Unicode: path: {:?}",
-                path.file_name()
-            );
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => {
+            println!("File name is not valid Unicode: {:?}", path);
+            return Ok(false);
         }
-    } else {
-        println!("No file name present in the path: {:?}", path);
-    }
+    };
 
-    Ok(())
+    let path_str = match normalize(path, root) {
+        Some(p) => p,
+        None => {
+            println!("Path is not valid Unicode: {:?}", path);
+            return Ok(false);
+        }
+    };
+
+    db::insert_file(
+        conn,
+        filesystem_id,
+        name,
+        &path_str,
+        file_size,
+        modified_secs,
+    )?;
+
+    Ok(true)
 }
 
 /// Determines the filesystem type in a Unix-specific manner
@@ -82,17 +108,4 @@ fn get_filesystem_type_unix(metadata: &fs::Metadata) -> String {
 fn get_filesystem_type_windows(metadata: &fs::Metadata) -> String {
     let file_index = metadata.file_index();
     format!("FS_TYPE_FOR_FILE_INDEX_{:?}", file_index)
-}
-
-/// Inserts the file metadata into the database
-fn insert_file_metadata(
-    conn: &Connection,
-    filesystem_id: i64,
-    name: &str,
-    path: &str,
-    size: u64,
-    modified: u64,
-) -> Result<()> {
-    db::insert_file(conn, filesystem_id, name, path, size, modified)?;
-    Ok(())
 }

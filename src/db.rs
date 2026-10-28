@@ -27,7 +27,19 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // the table is queried by path; without this every lookup is a full scan
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)",
+        [],
+    )?;
+
     Ok(())
+}
+
+/// Removes every file row. The inventory is a snapshot of one walk, never a
+/// merge of several, so a re-run replaces the previous result wholesale.
+pub fn purge_files(conn: &Connection) -> Result<usize> {
+    conn.execute("DELETE FROM files", [])
 }
 
 pub fn insert_or_get_filesystem(conn: &Connection, fs_type: &str) -> Result<i64> {
